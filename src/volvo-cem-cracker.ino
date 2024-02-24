@@ -20,11 +20,14 @@
 /* end of tunable parameters */
 
 #include <stdio.h>
-#include <FlexCAN_T4.h>
 
-#if !defined(__IMXRT1062__)
-#error Unsupported Teensy model, need 4.0
-#endif
+#include <Canbus.h>
+#include <defaults.h>
+#include <global.h>
+#include <mcp2515.h>
+#include <mcp2515_defs.h>
+#include <HardwareSerial.h>
+
 
 uint32_t cem_reply_min;
 uint32_t cem_reply_avg;
@@ -39,19 +42,9 @@ uint32_t cem_reply_max;
 #define CAN_250KBPS 250000      /* 250 Kbit speed */
 #define CAN_125KBPS 125000      /* 125 Kbit speed */
 
-FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> can_hs;
-FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> can_ls;
 
-typedef enum {
-  CAN_HS,       /* high-speed bus */
-  CAN_LS        /* low-speed bus */
-} can_bus_id_t;
 
-/* use the ARM cycle counter as the time-stamp */
-
-#define TSC ARM_DWT_CYCCNT
-
-#define printf Serial.printf
+//#define printf Serial.print
 
 #define CAN_MSG_SIZE    8       /* messages are always 8 bytes */
 
@@ -64,68 +57,12 @@ unsigned char  shuffle_orders[4][PIN_LEN] = { { 0, 1, 2, 3, 4, 5 }, { 3, 1, 5, 0
 
 unsigned char *shuffle_order;
 
-struct _cem_params {
-  unsigned long part_number;
-  int baud;
-  int shuffle;
-} cem_params[] = {
-// P1
-  { 8690719,  CAN_500KBPS, 0 },
-  { 8690720,  CAN_500KBPS, 0 },
-  { 8690721,  CAN_500KBPS, 0 },
-  { 8690722,  CAN_500KBPS, 0 },
-  { 30765471, CAN_500KBPS, 0 },
-  { 30728906, CAN_500KBPS, 0 },
-  { 30765015, CAN_500KBPS, 0 },
-  { 31254317, CAN_500KBPS, 0 },
-  { 31327215, CAN_500KBPS, 3 },
-  { 31254749, CAN_500KBPS, 3 },
-  { 31254903, CAN_500KBPS, 0 },
-  { 31296881, CAN_500KBPS, 0 },
 
-// P2 CEM-B (Brick shaped 1999-2004 with K-line)
-  { 8645716, CAN_250KBPS, 0 },
-  { 8645719, CAN_250KBPS, 0 },
-  { 8688434, CAN_250KBPS, 0 },
-  { 8688436, CAN_250KBPS, 0 },
-  { 8688513, CAN_250KBPS, 2 },
-  { 30657629, CAN_250KBPS, 0 },
-  { 9494336, CAN_250KBPS, 0 },
-  { 9494594, CAN_250KBPS, 0 },
-  { 8645171, CAN_250KBPS, 0 },
-  { 9452553, CAN_250KBPS, 0 },
-  { 8645205, CAN_250KBPS, 0 },
-  { 9452596, CAN_250KBPS, 0 },
-  { 8602436, CAN_250KBPS, 0 },
-  { 9469809, CAN_250KBPS, 0 },
-  { 8645200, CAN_250KBPS, 0 },
+// Define a file descriptor for the serial output:
+static FILE uartout = { 0 };
 
-// P2 CEM-L (L shaped and marked L 2005-2014)
-  { 30682981, CAN_500KBPS, 1 },
-  { 30682982, CAN_500KBPS, 1 },
-  { 30728542, CAN_500KBPS, 1 },
-  { 30765149, CAN_500KBPS, 1 },
-  { 30765646, CAN_500KBPS, 1 },
-  { 30786475, CAN_500KBPS, 1 },
-  { 30786889, CAN_500KBPS, 1 },
-  { 31282457, CAN_500KBPS, 1 },
-  { 31314468, CAN_500KBPS, 1 },
-  { 31394158, CAN_500KBPS, 1 },
-
-// P2 CEM-H (L shaped and marked H 2005 - 2007)
-  { 30786476, CAN_500KBPS, 1 },
-  { 30728539, CAN_500KBPS, 1 },
-  { 30682982, CAN_500KBPS, 1 },
-  { 30728357, CAN_500KBPS, 1 },
-  { 30765148, CAN_500KBPS, 1 },
-  { 30765643, CAN_500KBPS, 1 },
-  { 30786476, CAN_500KBPS, 1 },
-  { 30786890, CAN_500KBPS, 1 },
-  { 30795115, CAN_500KBPS, 1 },
-  { 31282455, CAN_500KBPS, 1 },
-  { 31394157, CAN_500KBPS, 1 },
-  { 30786579, CAN_500KBPS, 1 },
-};
+// Declare our put-character function:
+static int uart_putchar (char c, FILE *stream);
 
 /* measured latencies are stored for each of possible value of a single PIN digit */
 
@@ -152,44 +89,32 @@ bool cemUnlock (uint8_t *pin, uint8_t *pinUsed, uint32_t *latency, bool verbose)
  * Returns: 0 - was not sent
  */
 
-int canMsgSend (can_bus_id_t bus, bool ext, uint32_t id, uint8_t *data, bool verbose)
+int canMsgSend ( bool ext, uint32_t id, uint8_t *data, bool verbose)
 {
-  CAN_message_t msg;
+  //CAN_message_t msg;
+  tCAN msg;
   int ret;
 
   if (verbose == true) {
-      printf ("CAN_%cS ---> ID=%08x data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
-              bus == CAN_HS ? 'H' : 'L',
+      printf("SEND ID=%08x data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
               id, data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
    }
 
   /* prepare the message to transmit */
 
   msg.id = id;
-  msg.len = 8;
-  msg.flags.extended = ext;
-  memcpy (msg.buf, data, 8);
+  msg.header.rtr = 0;
+  msg.header.length = 8;
+  for (int i = 0; i < 8; i++)
+    msg.data[i] = data[i];
+
 
   /* send it to the appropriate bus */
-
-  switch (bus) {
-    case CAN_HS:
-      ret = can_hs.write(msg);
-      break;
-    case CAN_LS:
-      ret = can_ls.write(msg);
-      break;
-    default:
-      ret = 0;
-      break;
-  }
+  mcp2515_send_message(&msg);
   return ret;
 }
 
-CAN_message_t can_hs_event_msg;
-CAN_message_t can_ls_event_msg;
-volatile bool can_hs_event_msg_available = false;
-volatile bool can_ls_event_msg_available = false;
+
 
 /*******************************************************************************
  *
@@ -200,58 +125,41 @@ volatile bool can_ls_event_msg_available = false;
  * Returns: true if a message was available, false otherwise
  */
 
-bool canMsgReceive (can_bus_id_t bus, uint32_t *id, uint8_t *data, int wait, bool verbose)
+bool canMsgReceive ( unsigned int *id, uint8_t *data, int wait, bool verbose)
 {
   uint8_t *pData;
   uint32_t canId = 0;
   bool     ret = false;
-  volatile bool &msg_avail = (bus == CAN_HS ? can_hs_event_msg_available : can_ls_event_msg_available);
-  CAN_message_t &msg = (bus == CAN_HS ? can_hs_event_msg : can_ls_event_msg);
-  uint64_t start = TSC;
-  uint64_t end = start + wait * 1000 * clockCyclesPerMicrosecond();
+  tCAN msg ;
   int _wait = wait;
 
-  do {
-
-    /* call FlexCAN_T4's event handler to process queued messages */
-
-    bus == CAN_HS ? can_hs.events() : can_ls.events();
+  
 
     /* check if a message was available and process it */
 
-    if (msg_avail) {
+    if (mcp2515_check_message()) 
+    if(mcp2515_get_message(&msg)){
 
       /* process the global buffer set by can_hs.events */
 
-      msg_avail = false;
       canId = msg.id;
-      pData = msg.buf;
+      pData = msg.data;
       ret = true;
-    } else {
-      _wait = TSC < end;
-    }
-  } while (!ret && _wait);
+    } 
+  
 
-  /* no message, just return an error */
 
-  if (!ret) {
-    uint64_t now = TSC;
-    wait && printf("canMsgReceive timed out, start %llu, now %llu, diff %u\n", start, now, now - start);
-    return ret;
-  }
   /* save data to the caller if they provided buffers */
 
   if (id)
     *id = canId;
 
-  if (data)
+if (data)
     memcpy(data, pData, CAN_MSG_SIZE);
-
   /* print the message we received */
 
   if (verbose) {
-    printf ("CAN_%cS <--- ID=%08x data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
-            bus == CAN_HS ? 'H' : 'L',
+    printf ("RECEIVE ID=%08x data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
             canId, pData[0], pData[1], pData[2], pData[3], pData[4], pData[5], pData[6], pData[7]);
   }
 
@@ -357,7 +265,7 @@ bool cemUnlock (uint8_t *pin, uint8_t *pinUsed, uint32_t *latency, bool verbose)
   uint8_t  reply[CAN_MSG_SIZE];
   uint8_t *pMsgPin = unlockMsg + 2;
   uint32_t start, end, limit;
-  uint32_t id;
+  unsigned int id;
   uint32_t maxTime = 0;
 
   /* shuffle the PIN and set it in the request message */
@@ -367,31 +275,10 @@ bool cemUnlock (uint8_t *pin, uint8_t *pinUsed, uint32_t *latency, bool verbose)
 
   /* maximum time to collect our samples */
 
-  limit = TSC + 2 * 1000 * clockCyclesPerMicrosecond();
   intr = false;
 
   /* send the unlock request */
-  canMsgSend (CAN_HS, true, 0xffffe, unlockMsg, verbose);
-
-  start = end = TSC;
-  while (!intr && TSC < limit) {
-    /* if the line is high, the CAN bus is either idle or transmitting a bit */
-
-    if (digitalRead(CAN_L_PIN))
-      continue;
-
-    /* the CAN bus isn't idle, it's the start of the next bit */
-
-    end = TSC;
-
-    /* we only need to track the longest time we've seen */
-
-    if (end - start > maxTime)
-      maxTime = end - start;
-    /* start of the next sample */
-
-    start = end;
-  }
+  canMsgSend(true, 0xffffe, unlockMsg, verbose);
 
   /* default reply is set to indicate a failure */
 
@@ -399,12 +286,11 @@ bool cemUnlock (uint8_t *pin, uint8_t *pinUsed, uint32_t *latency, bool verbose)
 
   /* see if anything came back from the CEM */
 
-  canMsgReceive(CAN_HS, &id, reply, 1000, false);
+  canMsgReceive( &id, reply, 1000, false);
 
   /* return the maximum time between transmissions that we saw on the CAN bus */
 
-  if (latency)
-    *latency = maxTime;
+
 
   /* return PIN used if the caller wants it */
 
@@ -417,9 +303,9 @@ bool cemUnlock (uint8_t *pin, uint8_t *pinUsed, uint32_t *latency, bool verbose)
   return reply[2] == 0x00;
 }
 
-unsigned long ecu_read_part_number(can_bus_id_t bus, unsigned char id)
+unsigned long ecu_read_part_number( unsigned char id)
 {
-  uint32_t _id;
+  unsigned int _id;
   uint8_t  data[CAN_MSG_SIZE] = { 0xcb, id, 0xb9, 0xf0, 0x00, 0x00, 0x00, 0x00 };
   uint8_t rcv[CAN_MSG_SIZE];
   bool     verbose = true;
@@ -428,9 +314,9 @@ unsigned long ecu_read_part_number(can_bus_id_t bus, unsigned char id)
   int i, j = 0;
   int frame;
 
-  printf("Reading part number from ECU 0x%02x on CAN_%cS\n", id, bus == CAN_HS ? 'H' : 'L');
+  printf("Reading part number from ECU 0x%02x \n", id);
 yet_again:
-  canMsgSend(bus, true, 0xffffe, data, verbose);
+  canMsgSend( true, 0xffffe, data, verbose);
   i = 0;
   j++;
   frame = 0;
@@ -442,14 +328,13 @@ again:
     if (i > 20)
       goto yet_again;
 
-    ret = canMsgReceive(bus, &_id, rcv, 10, true);
+    ret = canMsgReceive( &_id, rcv, 10, false);
     if (!ret)
       goto again;
     _id &= 0xffff;
-    if (bus == CAN_HS && _id != 0x0003UL)
+    if (_id != 0x0003UL) //TODO: check if necessary
       goto again;
-    if (bus == CAN_LS && _id != 0x0003UL && _id != 0x0005UL)
-      goto again;
+    
     i = 0;
     if (frame == 0 && rcv[0] & 0x80) {
       pn *= 100; pn += bcdToBin(rcv[5]);
@@ -466,17 +351,17 @@ again:
   return pn;
 }
 
-unsigned long ecu_read_part_number_prog(can_bus_id_t bus, unsigned char id)
+unsigned long ecu_read_part_number_prog( unsigned char id)
 {
-  uint32_t _id;
+  unsigned int _id;
   uint8_t  data[CAN_MSG_SIZE] = { id, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
   bool     verbose = true;
   unsigned long pn = 0;
 
-  printf("Reading part number from ECU 0x%02x on CAN_%cS\n", id, bus == CAN_HS ? 'H' : 'L');
+  printf("Reading part number from ECU 0x%02x \n", id);
 
-  canMsgSend(bus, true, 0xffffe, data, verbose);
-  canMsgReceive(bus, &_id, data, 1000, verbose);
+  canMsgSend(true, 0xffffe, data, verbose);
+  canMsgReceive( &_id, data, 1000, verbose);
 
   for (int i = 0; i < 6; i++) {
     pn *= 100;
@@ -508,26 +393,22 @@ void can_prog_mode()
   printf ("Putting all ECUs into programming mode.\n");
   printf("\n === CEM-on-the-bench users: you have %d seconds to apply CEM power! ===\n\n", time / 1000);
 
-  while(canMsgReceive(CAN_HS, NULL, NULL, 1, false));
+  while(canMsgReceive( NULL, NULL, 1, false));
 
   /* broadcast a series of PROG mode requests */
 
-  while (time > 0) {
-    if ((time % 1000) == 0)
-      k_line_keep_alive();
-
 #ifdef P3
-    canMsgSend(CAN_HS, false, 0x7df, data, verbose);
-    canMsgSend(CAN_LS, false, 0x7df, data, verbose);
+    canMsgSend(false, 0x7df, data, verbose);
+    //canMsgSend(CAN_LS, false, 0x7df, data, verbose);
 #else
     canMsgSend(CAN_HS, true, 0xffffe, data, verbose);
     canMsgSend(CAN_LS, true, 0xffffe, data, verbose);
 #endif
-    verbose = false;
+    verbose = true;
     time -= delayTime;
     delay (delayTime);
-  }
-  while(canMsgReceive(CAN_HS, NULL, NULL, 1, false));
+  
+  while(canMsgReceive(NULL, NULL, 1, false));
 }
 
 /*******************************************************************************
@@ -547,10 +428,10 @@ void progModeOff (void)
   /* broadcast a series of reset requests */
 
   for (uint32_t i = 0; i < 50; i++) {
-    canMsgSend (CAN_HS, true, 0xffffe, data, verbose);
-    canMsgSend (CAN_LS, true, 0xffffe, data, verbose);
+    canMsgSend (true, 0xffffe, data, verbose);
+    //canMsgSend (CAN_LS, true, 0xffffe, data, verbose);
 
-    verbose = false;
+    verbose = true;
     delay (100);
   }
 }
@@ -912,7 +793,7 @@ void cemCrackPin (uint32_t maxBytes, bool verbose)
   if (cracked == true) {
 
     uint8_t data[CAN_MSG_SIZE];
-    uint32_t can_id = 0;
+    unsigned int can_id = 0;
 
     printf ("Validating PIN\n");
 
@@ -927,13 +808,13 @@ void cemCrackPin (uint32_t maxBytes, bool verbose)
     data[6] = pinUsed[4];
     data[7] = pinUsed[5];
 
-    canMsgSend (CAN_HS, true, 0xffffe, data, verbose);
+    canMsgSend (true, 0xffffe, data, verbose);
 
     /* get the response from the CEM */
 
     memset (data, 0, sizeof(data));
 
-    canMsgReceive(CAN_HS, &can_id, data, 10, false);
+    canMsgReceive( &can_id, data, 10, false);
 
     /* verify the response came from the CEM and is a successful reply to our request */
 
@@ -948,80 +829,13 @@ void cemCrackPin (uint32_t maxBytes, bool verbose)
   printf ("done\n");
 }
 
-void can_hs_event (const CAN_message_t &msg)
-{
-  can_hs_event_msg = msg;
-  can_hs_event_msg_available = true;
-}
-
-void can_ls_event (const CAN_message_t &msg)
-{
-  can_ls_event_msg = msg;
-  can_ls_event_msg_available = true;
-}
-
-void can_ls_init(int baud)
-{
-  can_ls.begin();
-  can_ls.setBaudRate(baud);
-  can_ls.enableFIFO();
-  can_ls.enableFIFOInterrupt();
-  can_ls.setFIFOFilter(ACCEPT_ALL);
-  can_ls.onReceive(can_ls_event);
-  printf ("CAN low-speed init done.\n");
-}
-
-void can_hs_init(int baud)
-{
-  can_hs.begin();
-  can_hs.setBaudRate(baud);
-  can_hs.enableFIFO();
-  can_hs.enableFIFOInterrupt();
-  can_hs.setFIFOFilter(ACCEPT_ALL);
-  can_hs.onReceive(can_hs_event);
-  printf ("CAN high-speed init done.\n");
-}
-
-/*******************************************************************************
- *
- * ext_output1 - called by FlexCAN_T4's receive interrupt handler
- *
- * Returns: N/A
- */
-
-void ext_output1(const CAN_message_t &msg)
-{
-  intr = 1;
-}
-
-void k_line_keep_alive()
-{
-  unsigned char msg[] = { 0x84, 0x40, 0x13, 0xb2, 0xf0, 0x03, 0x7c };
-
-  Serial3.write(msg, sizeof(msg));
-}
-
-bool find_cem_params(unsigned long pn, struct _cem_params *p)
-{
-  int i;
-  int n = sizeof(cem_params) / sizeof(struct _cem_params);
-
-  printf("Searching P/N %lu in %d known CEMs\n", pn, n);
-  for (i = 0; i < n; i++) {
-    if (cem_params[i].part_number == pn) {
-      *p = cem_params[i];
-      return true;
-    }
-  }
-  return false;
-}
 
 
 void p3_keep_alive(bool verbose)
 {
-  unsigned char msg[8] = { 0x3e, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+  unsigned char msg[8] = { 0x02,0x3e, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00};
 
-  canMsgSend(CAN_HS, false, 0x7df, msg, verbose);
+  canMsgSend( false, 0x7df, msg, verbose);
 }
 
 void p3_hash(unsigned char *pin, unsigned char *seed, unsigned char *hash)
@@ -1058,18 +872,18 @@ bool p3_cem_get_seed(unsigned char *seed, bool verbose)
   unsigned char req[8] = { 0x02, 0x27, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 };
   unsigned char msg[8];
   bool ret = true;
-  uint32_t id;
+  unsigned int id;
 
 again:
   do {
-    while (canMsgReceive(CAN_HS, NULL, NULL, 0, false));
+    while (canMsgReceive( NULL, NULL, 0, false));
     if (!ret) {
       delay(1000);
     }
-    canMsgSend(CAN_HS, false, 0x726, req, verbose);
+    canMsgSend( false, 0x726, req, verbose);
     id = 0xff;
     memset(msg, 0xff, sizeof(msg));
-    ret = canMsgReceive(CAN_HS, &id, msg, 1000, verbose);
+    ret = canMsgReceive( &id, msg, 1000, verbose);
   } while (!ret);
 
   if (ret && id == 0x72e && msg[0] == 0x05 && msg[1] == 0x67 && msg[2] == 0x01) {
@@ -1091,18 +905,18 @@ int p3_cem_send_key(unsigned char *key, bool verbose)
   unsigned char req[8] = { 0x05, 0x27, 0x02, key[0], key[1], key[2], 0x00, 0x00 };
   unsigned char msg[8];
   int ret = -1;
-  uint32_t id;
+  unsigned int id;
 
 again:
   do {
-    while (canMsgReceive(CAN_HS, NULL, NULL, 0, false));
+    while (canMsgReceive(NULL, NULL, 0, false));
     if (!ret) {
       delay(1000);
     }
-    canMsgSend(CAN_HS, false, 0x726, req, verbose);
+    canMsgSend( false, 0x726, req, verbose);
     id = 0xff;
     memset(msg, 0xff, sizeof(msg));
-    ret = canMsgReceive(CAN_HS, &id, msg, 1000, verbose);
+    ret = canMsgReceive(&id, msg, 1000, verbose);
   } while (!ret);
 
   if (id == 0x72e && msg[0] == 0x02 && msg[1] == 0x67 && msg[2] == 0x02) {
@@ -1129,9 +943,8 @@ void p3_find_hash_collision(unsigned char *_seed, unsigned char *_key)
   unsigned char pin[5] = { 0 };
   unsigned int i = 0;
   int ret;
-  bool verbose = false;
-  unsigned long now, last = TSC, diff;
-
+  bool verbose = true;
+  
   for (int p2 = 0; p2 < 0x100; p2++) {
     pin[2] = p2;
     for (int p3 = 0; p3 < 0x100; p3++) {
@@ -1139,33 +952,32 @@ void p3_find_hash_collision(unsigned char *_seed, unsigned char *_key)
       for (int p4 = 0; p4 < 0x100; p4++) {
         pin[4] = p4;
         if ((p4 % 10) == 0) {
-          p3_keep_alive(false);
+          p3_keep_alive(true);
         }
 retry:
         p3_cem_get_seed(seed, verbose);
         p3_hash(pin, seed, key);
-        now = TSC;
-        diff = (now - last) /  (1000 * clockCyclesPerMicrosecond());
-        if (verbose || diff >= 1000) {
+      
+
           printf("SEED %02x %02x %02x, PIN %02x %02x %02x %02x %02x, KEY %02x %02x %02x, %d pins/s\n", seed[0], seed[1], seed[2], pin[0], pin[1], pin[2], pin[3], pin[4], key[0], key[1], key[2], i);
-          last = now;
+          Serial.println(*seed);
           i = 0;
-        }
+        
         ret = p3_cem_send_key(key, verbose);
         if (ret > 0)
           goto out;
         else if (ret < 0) { // need new seed
-          p3_keep_alive(false);
+          p3_keep_alive(true);
           verbose = true;
           goto retry;
         }
-        verbose = false;
+        verbose = true;
         i++;
       }
     }
   }
 out:
-  printf("hash collision found\n");
+  Serial.println("hash collision found");
   printf("SEED %02x %02x %02x, PIN %02x %02x %02x %02x %02x, KEY %02x %02x %02x, %d pins/s\n", seed[0], seed[1], seed[2], pin[0], pin[1], pin[2], pin[3], pin[4], key[0], key[1], key[2], i);
   memcpy(_seed, seed, 3);
   memcpy(_key, key, 3);
@@ -1190,85 +1002,26 @@ bool initialized = false;
 
 void setup (void)
 {
-  bool hs_inited = false;
-  /* set up the serial port */
+   while(!Serial);
 
-  Serial.begin(115200);
-  Serial3.begin(10800); /* K-Line */
+      // Fill in UART file descriptor with pointer to my char-out func.
+   fdev_setup_stream(&uartout, uart_putchar, NULL, _FDEV_SETUP_WRITE);
+   stdout = &uartout;
+  Serial.begin(115200); // For debug use
+  Serial.println("CAN Read - Testing receival of CAN Bus message");
+  delay(5000);
 
-  delay (3000);
+  if (Canbus.init(CANSPEED_500)) // Initialise MCP2515 CAN controller at the specified speed
+    Serial.println("CAN Init ok");
+  else
+    Serial.println("Can't init CAN");
 
-  /* enable the time stamp counter */
-
-  ARM_DEMCR |= ARM_DEMCR_TRCENA;
-  ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
-
-  /* set up the pin for sampling the CAN bus */
-
-  pinMode (CAN_L_PIN, INPUT_PULLUP);
-
-//  set_arm_clock (180000000);
-
-  printf ("CPU Maximum Frequency:   %u\n", F_CPU);
-  printf ("CPU Frequency:           %u\n", F_CPU_ACTUAL);
-  printf ("Execution Rate:          %u cycles/us\n", clockCyclesPerMicrosecond ());
-
-#ifdef P3
-  printf("Cracking P3\n");
-#else
-  printf ("PIN bytes to measure:    %u\n", CALC_BYTES);
-  printf ("Number of samples:       %u\n", SAMPLES);
-#endif
-
-  long pn = 0;
-
-#ifdef P3
-  can_ls_init(CAN_125KBPS);
-  can_hs_init(CAN_500KBPS);
-  can_prog_mode();
-#else
-#if defined(CEM_PN_AUTODETECT)
-  can_hs.begin();
-  k_line_keep_alive();
   delay(1000);
-  can_ls_init(CAN_125KBPS);
-  k_line_keep_alive();
-  pn = ecu_read_part_number(CAN_LS, CEM_LS_ECU_ID);
 
-  if (!pn) {// might be CEM-L
-    printf("Can't find part number on CAN-LS, trying CAN-HS at 500 Kbps\n");
-    can_hs_init(CAN_500KBPS);
-    hs_inited = true;
-    pn = ecu_read_part_number(CAN_HS, CEM_HS_ECU_ID);
-  }
-#else
-  can_ls_init(CAN_125KBPS);
-  can_hs_init(CAN_500KBPS);
-  can_prog_mode();
-  pn = ecu_read_part_number_prog(CAN_HS, CEM_HS_ECU_ID);
-#endif
 
-  struct _cem_params hs_params;
-  if (!pn || !find_cem_params(pn, &hs_params)) {
-    printf("Unknown CEM part number %lu. Don't know what to do.\n", pn);
-    return;
-  }
-
-  shuffle_order = shuffle_orders[hs_params.shuffle];
-  printf("CAN HS baud rate: %d\n", hs_params.baud);
-  printf("PIN shuffle order: %d %d %d %d %d %d\n", shuffle_order[0], shuffle_order[1], shuffle_order[2], shuffle_order[3], shuffle_order[4], shuffle_order[5]);
-
-#if defined(CEM_PN_AUTODETECT)
-  if (!hs_inited)
-    can_hs_init(hs_params.baud);
-
-  can_prog_mode();
-  if (!hs_inited)
-      pn = ecu_read_part_number_prog(CAN_HS, CEM_HS_ECU_ID);
-#endif
-#endif // P3
+ // P3
   initialized = true;
-  printf ("Initialization done.\n\n");
+  Serial.print("Initialization done.\n\n");
 }
 
 /*******************************************************************************
@@ -1280,7 +1033,8 @@ void setup (void)
 
 void loop (void)
 {
-  bool verbose = false;
+  bool verbose = true;
+
 
   if (initialized)
 #ifdef P3
@@ -1297,4 +1051,13 @@ void loop (void)
 
   for (;;) {
   }
+}
+
+// My char output function
+static int uart_putchar (char c, FILE *stream)
+{
+   if( c == '\n' )
+      Serial.write('\r');
+   Serial.write(c) ;
+   return 0 ;
 }
